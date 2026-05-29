@@ -204,7 +204,7 @@ def cargar_desde_csv(archivo_bytes):
     # ── Dimensiones temporales ────────────────────────────────────────────────
     det["Año"]       = det["Fecha_Llegada"].dt.year
     det["Mes"]       = det["Fecha_Llegada"].dt.month
-    det["Semana"]    = det["Fecha_Llegada"].dt.isocalendar().week.astype("int64")
+    det["Semana"]    = det["Fecha_Llegada"].dt.isocalendar().week.astype("Int64")
     det["Mes_Nombre"] = det["Fecha_Llegada"].dt.strftime("%B %Y")
 
     func, banca, params = _construir_resumenes(det)
