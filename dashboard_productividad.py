@@ -38,32 +38,124 @@ SEMAFORO_COLOR = {
 }
 PALETA = ["#003366", "#0077CC", "#66B2FF", "#FF6B35", "#FFD166"]
 
+SITE_URL   = "https://bancoccidente.sharepoint.com/sites/ProyectoPotenciarelRolAsesoradeSoporteComercial"
+LIST_NAME  = "Lista_BotAsignacionMSN_PRD"
+META_CIRCULAR_DEF = 0.86
+META_FTE_DEF      = 115.83
+DIAS_HAB_DEF      = 104
+
 SP_CONFIGURADO = (
-    "SHAREPOINT_URL" in st.secrets
-    and "SHAREPOINT_USER" in st.secrets
+    "SHAREPOINT_USER" in st.secrets
     and "SHAREPOINT_PASS" in st.secrets
-    and "SHAREPOINT_FILE" in st.secrets
 )
 
 
-# ── Carga de datos ────────────────────────────────────────────────────────────
-def _parsear(buf):
-    det = pd.read_excel(
-        buf, sheet_name="Detalle",
-        parse_dates=["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"],
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _calcular_semaforo(pct):
+    if pct >= 0.95:
+        return "Verde"
+    elif pct >= META_CIRCULAR_DEF:
+        return "Amarillo"
+    return "Alerta"
+
+
+def _construir_resumenes(det):
+    # Resumen por banca y línea
+    banca = (
+        det.groupby(["Banca_Transformada", "Linea_Proceso"])
+        .agg(
+            Total_Ops=("Cantidad_Solicitudes", "sum"),
+            Cumple=("Cumplimiento", lambda x: (x == "CUMPLE").sum()),
+            Min_Ejecucion=("Min_Ejecucion", "sum"),
+        )
+        .reset_index()
     )
+    banca["Pct_Cumplimiento"] = banca["Cumple"] / banca["Total_Ops"]
+
+    # Resumen por funcionario
+    func = (
+        det.groupby(["Funcionario_Ejecutor", "Banca_Transformada"])
+        .agg(
+            Operaciones_Asignadas=("Cantidad_Solicitudes", "sum"),
+            Operaciones_Ejecutadas=("Cantidad_Solicitudes", "sum"),
+            Min_Ejecucion_Total=("Min_Ejecucion", "sum"),
+            Min_Asignacion_Total=("Min_Asignacion", "sum"),
+            Cumple=("Cumplimiento", lambda x: (x == "CUMPLE").sum()),
+            No_Cumple=("Cumplimiento", lambda x: (x != "CUMPLE").sum()),
+            Ultima_Actividad=("Fecha_Fin", "max"),
+        )
+        .reset_index()
+    )
+    func["Pct_Cumplimiento"] = func["Cumple"] / func["Operaciones_Ejecutadas"]
+    func["Eficiencia"] = func["Min_Ejecucion_Total"] / func["Min_Asignacion_Total"]
+    func["Semaforo"] = func["Pct_Cumplimiento"].apply(_calcular_semaforo)
+    func["Productividad_Estandarizada"] = (
+        func["Operaciones_Ejecutadas"] / META_FTE_DEF
+    ).round(4)
+    func["Ranking"] = func["Operaciones_Ejecutadas"].rank(ascending=False).astype(int)
+    func["Eficacia"] = 1.0
+    func["Efectividad"] = func["Operaciones_Ejecutadas"] / (func["Operaciones_Ejecutadas"].mean())
+
+    params = {
+        "Circular Reglamentaria":        META_CIRCULAR_DEF,
+        "Meta Teorica x FTE (16 dias)":  META_FTE_DEF,
+        "Días Hábiles Periodo":          DIAS_HAB_DEF,
+    }
+    return func, banca, params
+
+
+# ── Carga desde SharePoint List ───────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def cargar_desde_sharepoint():
+    from office365.runtime.auth.user_credential import UserCredential
+    from office365.sharepoint.client_context import ClientContext
+
+    ctx = ClientContext(SITE_URL).with_credentials(
+        UserCredential(st.secrets["SHAREPOINT_USER"], st.secrets["SHAREPOINT_PASS"])
+    )
+
+    sp_list = ctx.web.lists.get_by_title(LIST_NAME)
+    all_items = []
+
+    # Leer con paginación de 4999 (límite SharePoint)
+    sp_list.items.paged(4999, page_loaded=lambda items: all_items.extend(
+        [i.properties for i in items]
+    )).get().execute_query()
+
+    det = pd.DataFrame(all_items)
+
+    # Limpiar columnas internas de SharePoint
+    cols_sp = [c for c in det.columns if c.startswith(("_", "odata", "FileSystem", "GUID", "ContentType", "Attachments", "AuthorId", "EditorId"))]
+    det = det.drop(columns=cols_sp, errors="ignore")
+
+    # Parsear fechas
+    for col in ["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"]:
+        if col in det.columns:
+            det[col] = pd.to_datetime(det[col], errors="coerce")
+
+    # Asegurar numéricos
+    for col in ["Cantidad_Solicitudes", "Min_Asignacion", "Min_Ejecucion", "Min_Ciclo", "Semana", "Mes"]:
+        if col in det.columns:
+            det[col] = pd.to_numeric(det[col], errors="coerce")
+
+    func, banca, params = _construir_resumenes(det)
+    return det, func, banca, params
+
+
+# ── Carga desde Excel (respaldo) ──────────────────────────────────────────────
+def _parsear_excel(buf):
+    det = pd.read_excel(buf, sheet_name="Detalle",
+                        parse_dates=["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"])
     buf.seek(0)
     func = pd.read_excel(buf, sheet_name="Resumen_Funcionario",
                          parse_dates=["Ultima_Actividad"])
     buf.seek(0)
     banca = pd.read_excel(buf, sheet_name="Resumen_Banca")
     buf.seek(0)
-    params = pd.read_excel(buf, sheet_name="Parametros")
+    raw_params = pd.read_excel(buf, sheet_name="Parametros")
 
-    num_func = [
-        "Eficacia", "Efectividad", "Eficiencia",
-        "Productividad", "Productividad_Estandarizada", "Pct_Cumplimiento",
-    ]
+    num_func = ["Eficacia", "Efectividad", "Eficiencia",
+                "Productividad", "Productividad_Estandarizada", "Pct_Cumplimiento"]
     for c in num_func:
         if func[c].dtype == object:
             func[c] = func[c].str.replace(",", ".", regex=False).astype(float)
@@ -71,40 +163,28 @@ def _parsear(buf):
         banca["Pct_Cumplimiento"] = (
             banca["Pct_Cumplimiento"].str.replace(",", ".", regex=False).astype(float)
         )
-    p = dict(zip(params["Parametro"], params["Valor"]))
+    p = dict(zip(raw_params["Parametro"], raw_params["Valor"]))
     return det, func, banca, p
-
-
-@st.cache_data(ttl=3600)
-def cargar_desde_sharepoint():
-    from office365.runtime.auth.user_credential import UserCredential
-    from office365.sharepoint.client_context import ClientContext
-    from office365.sharepoint.files.file import File
-
-    ctx = ClientContext(st.secrets["SHAREPOINT_URL"]).with_credentials(
-        UserCredential(st.secrets["SHAREPOINT_USER"], st.secrets["SHAREPOINT_PASS"])
-    )
-    response = File.open_binary(ctx, st.secrets["SHAREPOINT_FILE"])
-    return _parsear(BytesIO(response.content))
 
 
 @st.cache_data
 def cargar_desde_bytes(archivo_bytes):
-    return _parsear(BytesIO(archivo_bytes))
+    return _parsear_excel(BytesIO(archivo_bytes))
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.markdown("## 📂 Datos")
 
 if SP_CONFIGURADO:
-    st.sidebar.info("Conectado a SharePoint")
+    st.sidebar.info("🔗 Conectado a SharePoint")
     if st.sidebar.button("🔄 Actualizar datos"):
         cargar_desde_sharepoint.clear()
+        st.rerun()
     try:
         det, func, banca, params = cargar_desde_sharepoint()
-        st.sidebar.success("✅ Datos cargados desde SharePoint")
+        st.sidebar.success("✅ Datos en tiempo real")
     except Exception as e:
-        st.sidebar.error(f"Error SharePoint: {e}")
+        st.sidebar.error(f"Error: {e}")
         st.stop()
 else:
     archivo = st.sidebar.file_uploader(
