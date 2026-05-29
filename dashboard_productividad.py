@@ -123,18 +123,90 @@ def _parsear_excel(buf):
     return det, func, banca, p
 
 
+def _tiempo_a_minutos(serie):
+    """Convierte 'HH:MM' a minutos desde medianoche."""
+    def _conv(val):
+        try:
+            partes = str(val).strip().split(":")
+            if len(partes) == 2:
+                return int(partes[0]) * 60 + int(partes[1])
+        except Exception:
+            pass
+        return None
+    return serie.apply(_conv)
+
+
 @st.cache_data
 def cargar_desde_csv(archivo_bytes):
-    det = pd.read_csv(
-        BytesIO(archivo_bytes),
-        encoding="utf-8-sig",
-        parse_dates=["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"],
-        dayfirst=True,
+    for enc in ["utf-8-sig", "latin-1", "cp1252"]:
+        try:
+            raw = pd.read_csv(BytesIO(archivo_bytes), encoding=enc, low_memory=False)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    det = pd.DataFrame()
+
+    # ── Identificadores y categorías ─────────────────────────────────────────
+    det["ID"]                 = raw.get("Consecutivo", raw.get("ID"))
+    det["Banca_Transformada"] = (
+        raw.get("Banca", "")
+        .str.replace("Banca ", "", regex=False)
+        .str.strip()
     )
-    for col in ["Cantidad_Solicitudes", "Min_Asignacion", "Min_Ejecucion",
-                "Min_Ciclo", "Min_Espera_Asignacion", "Semana", "Mes"]:
-        if col in det.columns:
-            det[col] = pd.to_numeric(det[col], errors="coerce")
+    det["Linea_Proceso"]      = raw.get("Linea de Proceso", raw.get("Linea_Proceso"))
+    det["Funcionario_Asignado"] = raw.get("Funcionario asignado", raw.get("Funcionario_Asignado"))
+    det["Funcionario_Ejecutor"] = raw.get("Funcionario Ejecutor", raw.get("Funcionario_Ejecutor"))
+    det["Estado_Solicitud"]   = raw.get("Estado de la solicitud", raw.get("Estado_Solicitud"))
+    det["Cargo_Comercial"]    = raw.get("Cargo Comercial", raw.get("Cargo_Comercial"))
+    det["Segmento"]           = raw.get("Segmento", "")
+    det["Actividad"]          = raw.get("Actividad realizada", raw.get("Actividad", ""))
+    det["Canal"]              = raw.get("Servicio/Canal", raw.get("Canal", ""))
+    det["Cantidad_Solicitudes"] = pd.to_numeric(
+        raw.get("Cantidad Solicitudes", raw.get("Cantidad_Solicitudes", 1)), errors="coerce"
+    ).fillna(1).astype(int)
+
+    # ── Fechas ────────────────────────────────────────────────────────────────
+    for col_dest, col_src in [
+        ("Fecha_Llegada",    "Fecha llegada correo"),
+        ("Fecha_Asignacion", "Fecha asignacion"),
+        ("Fecha_Fin",        "Fecha fin"),
+    ]:
+        det[col_dest] = pd.to_datetime(
+            raw.get(col_src, raw.get(col_dest)), dayfirst=True, errors="coerce"
+        )
+
+    # ── Tiempos en minutos ────────────────────────────────────────────────────
+    min_llegada   = _tiempo_a_minutos(raw.get("Hora llegada correo",   pd.Series()))
+    min_asignado  = _tiempo_a_minutos(raw.get("Hora asignacion",       pd.Series()))
+    min_ini_ejec  = _tiempo_a_minutos(raw.get("Hora inicio ejecucion", pd.Series()))
+    min_fin_ejec  = _tiempo_a_minutos(raw.get("Hora fin ejecucion",    pd.Series()))
+
+    det["Min_Asignacion"] = (min_asignado - min_llegada).clip(lower=0)
+
+    raw_ejec = pd.to_numeric(raw.get("Min_Fin_Ejecucion"), errors="coerce") - \
+               pd.to_numeric(raw.get("Min_Inicio_Ejecucion"), errors="coerce")
+    # Calcular desde horas si están disponibles; si no, usar columnas Min_*
+    ejec_horas = (min_fin_ejec - min_ini_ejec)
+    det["Min_Ejecucion"] = ejec_horas.where(ejec_horas.notna(), raw_ejec).clip(lower=0)
+
+    det["Min_Espera_Asignacion"] = (det["Min_Asignacion"] - det["Min_Ejecucion"]).clip(lower=0)
+    det["Min_Ciclo"]             = det["Min_Asignacion"] + det["Min_Ejecucion"]
+    det["Min_Ciclo_Ajustado"]    = det["Min_Ciclo"]
+
+    # ── Cumplimiento (umbral configurable, default 480 min = 1 día hábil) ────
+    umbral = st.session_state.get("umbral_ciclo", 480)
+    det["Cumplimiento"]          = det["Min_Ciclo"].apply(
+        lambda x: "CUMPLE" if pd.notna(x) and x <= umbral else "NO CUMPLE"
+    )
+    det["Cumplimiento_Ajustado"] = det["Cumplimiento"]
+
+    # ── Dimensiones temporales ────────────────────────────────────────────────
+    det["Año"]       = det["Fecha_Llegada"].dt.year
+    det["Mes"]       = det["Fecha_Llegada"].dt.month
+    det["Semana"]    = det["Fecha_Llegada"].dt.isocalendar().week.astype("int64")
+    det["Mes_Nombre"] = det["Fecha_Llegada"].dt.strftime("%B %Y")
+
     func, banca, params = _construir_resumenes(det)
     return det, func, banca, params
 
@@ -168,6 +240,14 @@ if archivo is None:
         "`Detalle`, `Resumen_Funcionario`, `Resumen_Banca`, `Parametros`"
     )
     st.stop()
+
+if archivo.name.endswith(".csv"):
+    st.session_state["umbral_ciclo"] = st.sidebar.number_input(
+        "Umbral cumplimiento (min)", min_value=30, max_value=2880,
+        value=st.session_state.get("umbral_ciclo", 480),
+        step=30,
+        help="Minutos máximos de ciclo para considerar CUMPLE. Default: 480 min (1 día hábil)",
+    )
 
 archivo_bytes = archivo.read()
 if archivo.name.endswith(".csv"):
