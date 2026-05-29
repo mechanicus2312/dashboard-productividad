@@ -149,11 +149,14 @@ def cargar_desde_csv(archivo_bytes):
 
     # ── Identificadores y categorías ─────────────────────────────────────────
     det["ID"]                 = raw.get("Consecutivo", raw.get("ID"))
-    det["Banca_Transformada"] = (
-        raw.get("Banca", "")
-        .str.replace("Banca ", "", regex=False)
-        .str.strip()
-    )
+    if "Banca_Transformada" in raw.columns:
+        det["Banca_Transformada"] = raw["Banca_Transformada"]
+    else:
+        det["Banca_Transformada"] = (
+            raw.get("Banca", "")
+            .str.replace("Banca ", "", regex=False)
+            .str.strip()
+        )
     det["Linea_Proceso"]      = raw.get("Linea de Proceso", raw.get("Linea_Proceso"))
     det["Funcionario_Asignado"] = raw.get("Funcionario asignado", raw.get("Funcionario_Asignado"))
     det["Funcionario_Ejecutor"] = raw.get("Funcionario Ejecutor", raw.get("Funcionario_Ejecutor"))
