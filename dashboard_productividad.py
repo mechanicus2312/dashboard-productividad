@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from io import BytesIO
 
 st.set_page_config(
     page_title="Dashboard Productividad",
@@ -67,14 +68,18 @@ if archivo is None:
 # ── Carga de datos ────────────────────────────────────────────────────────────
 @st.cache_data
 def cargar_datos(archivo_bytes):
+    buf = BytesIO(archivo_bytes)
     det = pd.read_excel(
-        archivo_bytes, sheet_name="Detalle",
+        buf, sheet_name="Detalle",
         parse_dates=["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"],
     )
-    func = pd.read_excel(archivo_bytes, sheet_name="Resumen_Funcionario",
+    buf.seek(0)
+    func = pd.read_excel(buf, sheet_name="Resumen_Funcionario",
                          parse_dates=["Ultima_Actividad"])
-    banca = pd.read_excel(archivo_bytes, sheet_name="Resumen_Banca")
-    params = pd.read_excel(archivo_bytes, sheet_name="Parametros")
+    buf.seek(0)
+    banca = pd.read_excel(buf, sheet_name="Resumen_Banca")
+    buf.seek(0)
+    params = pd.read_excel(buf, sheet_name="Parametros")
 
     num_func = [
         "Eficacia", "Efectividad", "Eficiencia",
