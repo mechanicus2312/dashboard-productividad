@@ -38,16 +38,10 @@ SEMAFORO_COLOR = {
 }
 PALETA = ["#003366", "#0077CC", "#66B2FF", "#FF6B35", "#FFD166"]
 
-SITE_URL   = "https://bancoccidente.sharepoint.com/sites/ProyectoPotenciarelRolAsesoradeSoporteComercial"
-LIST_NAME  = "Lista_BotAsignacionMSN_PRD"
 META_CIRCULAR_DEF = 0.86
 META_FTE_DEF      = 115.83
 DIAS_HAB_DEF      = 104
 
-SP_CONFIGURADO = (
-    "SHAREPOINT_USER" in st.secrets
-    and "SHAREPOINT_PASS" in st.secrets
-)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,44 +98,6 @@ def _construir_resumenes(det):
     return func, banca, params
 
 
-# ── Carga desde SharePoint List ───────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def cargar_desde_sharepoint():
-    from office365.runtime.auth.user_credential import UserCredential
-    from office365.sharepoint.client_context import ClientContext
-
-    ctx = ClientContext(SITE_URL).with_credentials(
-        UserCredential(st.secrets["SHAREPOINT_USER"], st.secrets["SHAREPOINT_PASS"])
-    )
-
-    sp_list = ctx.web.lists.get_by_title(LIST_NAME)
-    all_items = []
-
-    # Leer con paginación de 4999 (límite SharePoint)
-    sp_list.items.paged(4999, page_loaded=lambda items: all_items.extend(
-        [i.properties for i in items]
-    )).get().execute_query()
-
-    det = pd.DataFrame(all_items)
-
-    # Limpiar columnas internas de SharePoint
-    cols_sp = [c for c in det.columns if c.startswith(("_", "odata", "FileSystem", "GUID", "ContentType", "Attachments", "AuthorId", "EditorId"))]
-    det = det.drop(columns=cols_sp, errors="ignore")
-
-    # Parsear fechas
-    for col in ["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"]:
-        if col in det.columns:
-            det[col] = pd.to_datetime(det[col], errors="coerce")
-
-    # Asegurar numéricos
-    for col in ["Cantidad_Solicitudes", "Min_Asignacion", "Min_Ejecucion", "Min_Ciclo", "Semana", "Mes"]:
-        if col in det.columns:
-            det[col] = pd.to_numeric(det[col], errors="coerce")
-
-    func, banca, params = _construir_resumenes(det)
-    return det, func, banca, params
-
-
 # ── Carga desde Excel (respaldo) ──────────────────────────────────────────────
 def _parsear_excel(buf):
     det = pd.read_excel(buf, sheet_name="Detalle",
@@ -168,46 +124,58 @@ def _parsear_excel(buf):
 
 
 @st.cache_data
-def cargar_desde_bytes(archivo_bytes):
+def cargar_desde_csv(archivo_bytes):
+    det = pd.read_csv(
+        BytesIO(archivo_bytes),
+        encoding="utf-8-sig",
+        parse_dates=["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"],
+        dayfirst=True,
+    )
+    for col in ["Cantidad_Solicitudes", "Min_Asignacion", "Min_Ejecucion",
+                "Min_Ciclo", "Min_Espera_Asignacion", "Semana", "Mes"]:
+        if col in det.columns:
+            det[col] = pd.to_numeric(det[col], errors="coerce")
+    func, banca, params = _construir_resumenes(det)
+    return det, func, banca, params
+
+
+@st.cache_data
+def cargar_desde_xlsx(archivo_bytes):
     return _parsear_excel(BytesIO(archivo_bytes))
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.markdown("## 📂 Datos")
 
-if SP_CONFIGURADO:
-    st.sidebar.info("🔗 Conectado a SharePoint")
-    if st.sidebar.button("🔄 Actualizar datos"):
-        cargar_desde_sharepoint.clear()
-        st.rerun()
-    try:
-        det, func, banca, params = cargar_desde_sharepoint()
-        st.sidebar.success("✅ Datos en tiempo real")
-    except Exception as e:
-        st.sidebar.error(f"Error: {e}")
-        st.stop()
-else:
-    archivo = st.sidebar.file_uploader(
-        "Sube el archivo Excel",
-        type=["xlsx"],
-        help="Hojas requeridas: Detalle, Resumen_Funcionario, Resumen_Banca, Parametros",
+archivo = st.sidebar.file_uploader(
+    "Sube el archivo de datos",
+    type=["csv", "xlsx"],
+    help="CSV exportado de SharePoint o Excel con las 4 hojas procesadas",
+)
+
+if archivo is None:
+    st.markdown(
+        '<div class="header-box"><h2 style="margin:0">📊 Dashboard de Productividad</h2></div>',
+        unsafe_allow_html=True,
     )
-    if archivo is None:
-        st.markdown(
-            '<div class="header-box"><h2 style="margin:0">📊 Dashboard de Productividad</h2></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown("### Para comenzar, sube el archivo de datos desde el panel izquierdo.")
-        st.info(
-            "**Formato esperado:** archivo `.xlsx` con las hojas:\n"
-            "- `Detalle` — operaciones individuales\n"
-            "- `Resumen_Funcionario` — métricas por funcionario\n"
-            "- `Resumen_Banca` — resumen por banca y línea\n"
-            "- `Parametros` — metas y parámetros del período"
-        )
-        st.stop()
-    det, func, banca, params = cargar_desde_bytes(archivo.read())
-    st.sidebar.success(f"✅ {archivo.name}")
+    st.markdown("### Para comenzar, sube el archivo desde el panel izquierdo.")
+    st.info(
+        "**Opción 1 — CSV de SharePoint** *(recomendado)*\n"
+        "1. Entra a la lista en SharePoint\n"
+        "2. Exporta a Excel → descarga el `.csv`\n"
+        "3. Súbelo aquí\n\n"
+        "**Opción 2 — Excel procesado** `.xlsx` con hojas: "
+        "`Detalle`, `Resumen_Funcionario`, `Resumen_Banca`, `Parametros`"
+    )
+    st.stop()
+
+archivo_bytes = archivo.read()
+if archivo.name.endswith(".csv"):
+    det, func, banca, params = cargar_desde_csv(archivo_bytes)
+else:
+    det, func, banca, params = cargar_desde_xlsx(archivo_bytes)
+
+st.sidebar.success(f"✅ {archivo.name}")
 
 META_CIRCULAR = float(params.get("Circular Reglamentaria", 0.86))
 META_FTE      = float(params.get("Meta Teorica x FTE (16 dias)", 115.83))
