@@ -38,37 +38,16 @@ SEMAFORO_COLOR = {
 }
 PALETA = ["#003366", "#0077CC", "#66B2FF", "#FF6B35", "#FFD166"]
 
-
-# ── Uploader en sidebar ───────────────────────────────────────────────────────
-st.sidebar.markdown("## 📂 Datos")
-archivo = st.sidebar.file_uploader(
-    "Sube el archivo Excel",
-    type=["xlsx"],
-    help="Debe tener las hojas: Detalle, Resumen_Funcionario, Resumen_Banca, Parametros",
+SP_CONFIGURADO = (
+    "SHAREPOINT_URL" in st.secrets
+    and "SHAREPOINT_USER" in st.secrets
+    and "SHAREPOINT_PASS" in st.secrets
+    and "SHAREPOINT_FILE" in st.secrets
 )
 
 
-# ── Pantalla de bienvenida si no hay archivo ──────────────────────────────────
-if archivo is None:
-    st.markdown(
-        '<div class="header-box"><h2 style="margin:0">📊 Dashboard de Productividad</h2></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("### Para comenzar, sube el archivo de datos desde el panel izquierdo.")
-    st.info(
-        "**Formato esperado:** archivo `.xlsx` con las hojas:\n"
-        "- `Detalle` — operaciones individuales\n"
-        "- `Resumen_Funcionario` — métricas por funcionario\n"
-        "- `Resumen_Banca` — resumen por banca y línea\n"
-        "- `Parametros` — metas y parámetros del período"
-    )
-    st.stop()
-
-
 # ── Carga de datos ────────────────────────────────────────────────────────────
-@st.cache_data
-def cargar_datos(archivo_bytes):
-    buf = BytesIO(archivo_bytes)
+def _parsear(buf):
     det = pd.read_excel(
         buf, sheet_name="Detalle",
         parse_dates=["Fecha_Llegada", "Fecha_Asignacion", "Fecha_Fin"],
@@ -92,18 +71,68 @@ def cargar_datos(archivo_bytes):
         banca["Pct_Cumplimiento"] = (
             banca["Pct_Cumplimiento"].str.replace(",", ".", regex=False).astype(float)
         )
-
     p = dict(zip(params["Parametro"], params["Valor"]))
     return det, func, banca, p
 
 
-det, func, banca, params = cargar_datos(archivo.read())
+@st.cache_data(ttl=3600)
+def cargar_desde_sharepoint():
+    from office365.runtime.auth.user_credential import UserCredential
+    from office365.sharepoint.client_context import ClientContext
+    from office365.sharepoint.files.file import File
+
+    ctx = ClientContext(st.secrets["SHAREPOINT_URL"]).with_credentials(
+        UserCredential(st.secrets["SHAREPOINT_USER"], st.secrets["SHAREPOINT_PASS"])
+    )
+    response = File.open_binary(ctx, st.secrets["SHAREPOINT_FILE"])
+    return _parsear(BytesIO(response.content))
+
+
+@st.cache_data
+def cargar_desde_bytes(archivo_bytes):
+    return _parsear(BytesIO(archivo_bytes))
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+st.sidebar.markdown("## 📂 Datos")
+
+if SP_CONFIGURADO:
+    st.sidebar.info("Conectado a SharePoint")
+    if st.sidebar.button("🔄 Actualizar datos"):
+        cargar_desde_sharepoint.clear()
+    try:
+        det, func, banca, params = cargar_desde_sharepoint()
+        st.sidebar.success("✅ Datos cargados desde SharePoint")
+    except Exception as e:
+        st.sidebar.error(f"Error SharePoint: {e}")
+        st.stop()
+else:
+    archivo = st.sidebar.file_uploader(
+        "Sube el archivo Excel",
+        type=["xlsx"],
+        help="Hojas requeridas: Detalle, Resumen_Funcionario, Resumen_Banca, Parametros",
+    )
+    if archivo is None:
+        st.markdown(
+            '<div class="header-box"><h2 style="margin:0">📊 Dashboard de Productividad</h2></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("### Para comenzar, sube el archivo de datos desde el panel izquierdo.")
+        st.info(
+            "**Formato esperado:** archivo `.xlsx` con las hojas:\n"
+            "- `Detalle` — operaciones individuales\n"
+            "- `Resumen_Funcionario` — métricas por funcionario\n"
+            "- `Resumen_Banca` — resumen por banca y línea\n"
+            "- `Parametros` — metas y parámetros del período"
+        )
+        st.stop()
+    det, func, banca, params = cargar_desde_bytes(archivo.read())
+    st.sidebar.success(f"✅ {archivo.name}")
 
 META_CIRCULAR = float(params.get("Circular Reglamentaria", 0.86))
 META_FTE      = float(params.get("Meta Teorica x FTE (16 dias)", 115.83))
 DIAS_HABILES  = int(params.get("Días Hábiles Periodo", 104))
 
-st.sidebar.success(f"✅ {archivo.name}")
 st.sidebar.divider()
 
 # ── Filtros ───────────────────────────────────────────────────────────────────
